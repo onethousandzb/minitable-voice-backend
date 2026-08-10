@@ -184,6 +184,20 @@ function toStartSec(dateStr, timeStr, timezone) {
   return `${y}-${pad(mo)}-${pad(d)} ${pad(hh)}:${pad(mm)}`;
 }
 
+// 把毫秒时间戳(reserve/info 返回的 reservation_time)按门店时区转成 "YYYY-MM-DD HH:MM"。
+// 用于「只改人数不改时间」时,拿原预约的时间作为目标时间。
+function msToStartSec(ms, timezone) {
+  const d = new Date(Number(ms));
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const map = {};
+  parts.forEach(p => (map[p.type] = p.value));
+  let hh = map.hour === '24' ? '00' : map.hour; // 兼容个别环境 24:00
+  return `${map.year}-${map.month}-${map.day} ${hh}:${map.minute}`;
+}
+
 // 求某 UTC 时刻在指定时区的偏移量(秒)。
 function tzOffsetSec(date, timezone) {
   const dtf = new Intl.DateTimeFormat('en-US', {
@@ -389,22 +403,50 @@ async function handleFindReservation(body) {
 // ────────────────────────────────────────────────────────────
 async function handleModifyReservation(body) {
   const { store_id, guest_phone, new_time, new_date, new_party_size, new_notes } = body;
-  if (!store_id || !guest_phone || !new_time) return { _status: 400, error: 'Missing store_id, guest_phone or new_time' };
+  if (!store_id || !guest_phone) return { _status: 400, error: 'Missing store_id or guest_phone' };
+  // 至少要改点什么:时间、人数、或备注
+  const wantsTimeChange = !!new_time;
+  const wantsPartyChange = (new_party_size !== undefined && new_party_size !== null && new_party_size !== '');
+  const wantsNoteChange = (new_notes !== undefined && new_notes !== null);
+  if (!wantsTimeChange && !wantsPartyChange && !wantsNoteChange) {
+    return { _status: 400, error: 'Nothing to change: provide new_time, new_party_size, or new_notes' };
+  }
 
   const active = await findActiveBooking(guest_phone);
   if (!active) return { success: false, message: `No active reservation found for ${guest_phone}.` };
   const booking_id = active.booking_id;
   const origPartySize = (active.info && active.info.party_size) || 2;
   const origNote = (active.info && active.info.note) || '';
-  const finalNote = (new_notes !== undefined && new_notes !== null) ? new_notes : origNote; // 没传新备注就保留原备注
+
+  const finalNote = wantsNoteChange ? new_notes : origNote;          // 没传新备注就保留原备注
+  const finalParty = wantsPartyChange ? Number(new_party_size) : origPartySize;
 
   const tz = await getMerchantTimezone(store_id);
-  const startSec = toStartSec(new_date, new_time, tz);
+  const origStartSec = (active.info && active.info.reservation_time) ? msToStartSec(active.info.reservation_time, tz) : null;
 
-  // 先查新时间有没有位
+  // 情况 A:只改备注(不改时间、不改人数)→ 跳过查位,直接用原时间更新 note。
+  if (!wantsTimeChange && !wantsPartyChange) {
+    await callSAAS('/weapp/voice-agent/reserve/update', {
+      booking: { booking_id, note: finalNote },
+    });
+    return {
+      success: true, note_only: true, notes: finalNote,
+      message: `Note updated${finalNote ? ' to: ' + finalNote : ' (cleared)'}. Time and party size unchanged.`,
+    };
+  }
+
+  // 情况 B:改时间和/或人数 → 需要一个目标时间。没传新时间就用原预约时间。
+  const startSec = wantsTimeChange ? toStartSec(new_date, new_time, tz)
+                                   : origStartSec;
+  if (!startSec) {
+    // 拿不到原时间(极少见),无法在不查位的情况下安全改人数,提示补时间。
+    return { success: false, message: `To change the party size, please also confirm the reservation time.` };
+  }
+
+  // 查目标时间 + 目标人数是否有位
   const checkResp = await callSAAS('/weapp/voice-agent/reserve/availability/check', {
     merchant_id: store_id,
-    party_size: String(new_party_size || origPartySize),
+    party_size: String(finalParty),
     slot_time: [{ start_sec: startSec, duration_sec: CONFIG.DEFAULT_DURATION_SEC }],
   });
   const slot = (checkResp.slot_time_availability || [])[0] || {};
@@ -412,26 +454,27 @@ async function handleModifyReservation(body) {
     let alternatives = [];
     try {
       const sug = await callSAAS('/weapp/voice-agent/reserve/availability/suggest', {
-        merchant_id: store_id, party_size: Number(new_party_size || origPartySize),
+        merchant_id: store_id, party_size: finalParty,
         slot_time: { start_sec: startSec, duration_sec: CONFIG.DEFAULT_DURATION_SEC },
       });
       alternatives = (sug.suggest_slot_time || []).map(s => toUSTime(s.start_sec, tz));
     } catch {}
+    const timeLabel = wantsTimeChange ? new_time : 'that time';
     return { success: false, available: false, alternatives,
-      message: `${new_time} is not available. Alternatives: ${alternatives.join(', ') || 'none'}. The original reservation is unchanged.` };
+      message: `${timeLabel} is not available for ${finalParty}. Alternatives: ${alternatives.join(', ') || 'none'}. The original reservation is unchanged.` };
   }
 
-  // 有位 → 更新(带上备注,保留原备注或用新的)
+  // 有位 → 更新时间/人数,并带上备注(改了用新的,没改保留原的)
   await callSAAS('/weapp/voice-agent/reserve/update', {
     booking: {
       booking_id,
-      slot: { start_sec: startSec, party_size: Number(new_party_size || origPartySize) },
+      slot: { start_sec: startSec, party_size: finalParty },
       note: finalNote,
     },
   });
   return {
     success: true, available: true, notes: finalNote,
-    message: `Reservation updated to ${new_time}, party of ${new_party_size || origPartySize}${finalNote ? ', note: ' + finalNote : ''}.`,
+    message: `Reservation updated${wantsTimeChange ? ' to ' + new_time : ''}, party of ${finalParty}${finalNote ? ', note: ' + finalNote : ''}.`,
   };
 }
 
