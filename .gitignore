@@ -1,0 +1,11 @@
+# 密钥绝不进仓库
+.env
+.env.local
+*.local
+
+# 依赖
+node_modules/
+
+# 日志和系统文件
+*.log
+.DS_Store

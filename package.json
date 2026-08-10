@@ -1,0 +1,13 @@
+{
+  "name": "minitable-voice-backend",
+  "version": "1.0.0",
+  "description": "Middle layer bridging the ElevenLabs voice agent to the Minitable SAAS API.",
+  "main": "real-backend.js",
+  "scripts": {
+    "start": "node real-backend.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
