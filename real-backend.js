@@ -439,10 +439,19 @@ async function handleModifyReservation(body) {
   const tz = await getMerchantTimezone(store_id);
   const origStartSec = (active.info && active.info.reservation_time) ? msToStartSec(active.info.reservation_time, tz) : null;
 
-  // 情况 A:只改备注(不改时间、不改人数)→ 跳过查位,直接用原时间更新 note。
+  // 情况 A:只改备注(不改时间、不改人数)→ 跳过查位,用原时间+原人数,只把 note 换成新的。
+  // 注意:Minitable 的 update 需要带 slot,不能只传 note,否则 400。
   if (!wantsTimeChange && !wantsPartyChange) {
+    if (!origStartSec) {
+      // 拿不到原预约时间,无法组一个完整的 update 请求。
+      return { success: false, message: `I couldn't read the current reservation time, so I can't update the note right now.` };
+    }
     await callSAAS('/weapp/voice-agent/reserve/update', {
-      booking: { booking_id, note: finalNote },
+      booking: {
+        booking_id,
+        slot: { start_sec: origStartSec, party_size: origPartySize },
+        note: finalNote,
+      },
     });
     return {
       success: true, note_only: true, notes: finalNote,
