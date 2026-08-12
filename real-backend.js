@@ -447,10 +447,11 @@ async function handleModifyReservation(body) {
       return { success: false, message: `I couldn't read the current reservation time, so I can't update the note right now.` };
     }
     await callSAAS('/weapp/voice-agent/reserve/update', {
+      note: finalNote,   // 顶层放一份(与 create 一致)
       booking: {
         booking_id,
         slot: { start_sec: origStartSec, party_size: origPartySize },
-        note: finalNote,
+        note: finalNote, // booking 内也放一份,双保险
       },
     });
     return {
@@ -490,10 +491,11 @@ async function handleModifyReservation(body) {
 
   // 有位 → 更新时间/人数,并带上备注(改了用新的,没改保留原的)
   await callSAAS('/weapp/voice-agent/reserve/update', {
+    note: finalNote,   // 顶层放一份(与 create 一致)
     booking: {
       booking_id,
       slot: { start_sec: startSec, party_size: finalParty },
-      note: finalNote,
+      note: finalNote, // booking 内也放一份,双保险
     },
   });
   return {
