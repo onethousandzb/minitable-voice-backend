@@ -1,0 +1,17 @@
+{
+    "name": "voice-ai-admin",
+    "script": "real-backend.js",
+    "cwd": "./",
+    "exec_mode": "fork",
+    "watch": false,
+    "ignore_watch": ["tmp"],
+    "env": {
+        "MINITABLE_API_BASE": "https://ai.minitable.net",
+        "MINITABLE_USER": "",
+        "MINITABLE_PASS": ""
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "log_date_format": "YYYY/MM/DD HH:mm:ss"
+}
