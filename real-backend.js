@@ -585,7 +585,9 @@ async function handleJoinCallAhead(body) {
   return {
     success: true,
     expected_arrival_time,
-    message: `You're on the call-ahead list for ${expected_arrival_time}. Please check in at the host stand when you arrive.`,
+    guest_name,
+    party_size: Number(party_size),
+    message: `Added to the call-ahead list: ${guest_name}, party of ${party_size}, arriving around ${expected_arrival_time}. Near the arrival time the name is automatically added to the waitlist, and a text is sent.`,
   };
 }
 
