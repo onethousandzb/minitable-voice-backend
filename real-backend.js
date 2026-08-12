@@ -316,10 +316,25 @@ async function handleCreateReservation(body) {
     source: body._source_override || CONFIG.SOURCE, // 测试:可用 _source_override 覆盖
   });
 
-  // 他们的返回:成功 → { booking: { booking_id, status: "CONFIRMED" | "PENDING_MERCHANT_CONFIRMATION", ... } }
+  // 他们的返回:成功 → { booking: { booking_id, status: ... } }
   //             失败 → { booking_failure: { cause } }
   if (resp.booking_failure && resp.booking_failure.cause) {
-    return { success: false, message: `Could not create the reservation: ${resp.booking_failure.cause}` };
+    const cause = String(resp.booking_failure.cause);
+    // 识别「疑似重复预约」这类原因,给 AI 结构化信号 + 友好话术,而不是把技术错误读给客人。
+    const looksDuplicate = /duplicat|already|exist|same/i.test(cause);
+    if (looksDuplicate) {
+      return {
+        success: false,
+        duplicate_suspected: true,   // AI 据此走「疑似重复」话术,而不是报错
+        message: `It looks like there may already be a reservation under this phone number for a similar time. This could be a duplicate.`,
+      };
+    }
+    // 其它失败,也不要把原始技术错误读给客人
+    return {
+      success: false,
+      message: `I wasn't able to complete that reservation just now.`,
+      _cause: cause,   // 仅供日志排查,AI 不念给客人
+    };
   }
   const booking = resp.booking || {};
   const status = booking.status || '';
