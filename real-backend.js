@@ -533,7 +533,7 @@ async function handleJoinWaitlist(body) {
   const resp = await callSAAS('/weapp/voice-agent/waitlist/create', {
     merchant_id: store_id,
     party_size: Number(party_size),
-    telephone: guest_phone,
+    telephone: normalizePhone(guest_phone),
     customer_name: guest_name,
     note: notes || '',
     source: CONFIG.SOURCE,
