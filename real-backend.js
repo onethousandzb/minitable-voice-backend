@@ -231,6 +231,34 @@ function toUSTime(startStr, timezone) {
 }
 
 // ────────────────────────────────────────────────────────────
+//  检测 SAAS 响应里是否表示「人数超出上限」。
+//  开发确认:超过门店设置的最大人数时,SAAS 返回 PEOPLE_NUM_UNAVAILABLE。
+//  查位和落单两处都可能出现,统一在这里判断。
+// ────────────────────────────────────────────────────────────
+function isPeopleNumUnavailable(resp) {
+  if (!resp) return false;
+  // 把整个响应转成字符串扫一遍,兼容它出现在 code / cause / message / 任意字段里。
+  try {
+    return /PEOPLE_NUM_UNAVAILABLE/i.test(JSON.stringify(resp));
+  } catch (e) {
+    return false;
+  }
+}
+
+// 统一的「人数超出、需转门店」返回体(查位和落单共用)。
+function tooLargeResponse(party_size, maxParty) {
+  return {
+    available: false,
+    success: false,
+    too_large: true,          // AI 据此走「人数超出 → 说明 + 转人工」流程
+    people_num_unavailable: true,
+    max_party_size: maxParty != null ? maxParty : undefined,
+    alternatives: [],
+    message: `A party of ${party_size} is larger than this restaurant can book automatically. Groups this size need to be arranged directly with the restaurant — let the guest know you'll transfer them to the restaurant to arrange it.`,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
 //  接口 1:查空位  POST /check-availability
 //  AI 侧入参: { store_id, date, time, party_size }
 //  → 调 reserve/availability/check;不可用时再调 suggest 拿备选
@@ -241,16 +269,10 @@ async function handleCheckAvailability(body) {
     return { _status: 400, error: 'Missing store_id, time or party_size' };
   }
 
-  // 大 party 检查:超过门店可 AI 预约的最大人数,需转人工,不去查位。
+  // 大 party 检查(本地预判):超过缓存的 people_num_max,直接判定需转人工,不去查位。
   const maxParty = await getMaxPartySize(store_id);
   if (maxParty != null && Number(party_size) > maxParty) {
-    return {
-      available: false,
-      too_large: true,
-      max_party_size: maxParty,
-      alternatives: [],
-      message: `A party of ${party_size} is above the maximum of ${maxParty} that can be booked automatically. Parties of ${maxParty + 1} or more are arranged directly with the restaurant — the guest should be transferred to the restaurant.`,
-    };
+    return tooLargeResponse(party_size, maxParty);
   }
 
   const tz = await getMerchantTimezone(store_id);
@@ -263,6 +285,11 @@ async function handleCheckAvailability(body) {
     party_size: String(party_size),
     slot_time: [{ start_sec: startSec, duration_sec: duration }],
   });
+
+  // SAAS 返回人数超上限(PEOPLE_NUM_UNAVAILABLE)→ 需转人工。
+  if (isPeopleNumUnavailable(checkResp)) {
+    return tooLargeResponse(party_size, maxParty);
+  }
 
   const slot = (checkResp.slot_time_availability || [])[0] || {};
   const available = !!slot.available;
@@ -315,6 +342,12 @@ async function handleCreateReservation(body) {
     },
     source: body._source_override || CONFIG.SOURCE, // 测试:可用 _source_override 覆盖
   });
+
+  // SAAS 返回人数超上限(PEOPLE_NUM_UNAVAILABLE)→ 需转人工,不当作普通失败。
+  if (isPeopleNumUnavailable(resp)) {
+    const maxParty = await getMaxPartySize(store_id);
+    return tooLargeResponse(party_size, maxParty);
+  }
 
   // 他们的返回:成功 → { booking: { booking_id, status: ... } }
   //             失败 → { booking_failure: { cause } }
