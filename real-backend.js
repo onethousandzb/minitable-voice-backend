@@ -231,34 +231,6 @@ function toUSTime(startStr, timezone) {
 }
 
 // ────────────────────────────────────────────────────────────
-//  检测 SAAS 响应里是否表示「人数超出上限」。
-//  开发确认:超过门店设置的最大人数时,SAAS 返回 PEOPLE_NUM_UNAVAILABLE。
-//  查位和落单两处都可能出现,统一在这里判断。
-// ────────────────────────────────────────────────────────────
-function isPeopleNumUnavailable(resp) {
-  if (!resp) return false;
-  // 把整个响应转成字符串扫一遍,兼容它出现在 code / cause / message / 任意字段里。
-  try {
-    return /PEOPLE_NUM_UNAVAILABLE/i.test(JSON.stringify(resp));
-  } catch (e) {
-    return false;
-  }
-}
-
-// 统一的「人数超出、需转门店」返回体(查位和落单共用)。
-function tooLargeResponse(party_size, maxParty) {
-  return {
-    available: false,
-    success: false,
-    too_large: true,          // AI 据此走「人数超出 → 说明 + 转人工」流程
-    people_num_unavailable: true,
-    max_party_size: maxParty != null ? maxParty : undefined,
-    alternatives: [],
-    message: `A party of ${party_size} is larger than this restaurant can book automatically. Groups this size need to be arranged directly with the restaurant — let the guest know you'll transfer them to the restaurant to arrange it.`,
-  };
-}
-
-// ────────────────────────────────────────────────────────────
 //  接口 1:查空位  POST /check-availability
 //  AI 侧入参: { store_id, date, time, party_size }
 //  → 调 reserve/availability/check;不可用时再调 suggest 拿备选
@@ -269,10 +241,16 @@ async function handleCheckAvailability(body) {
     return { _status: 400, error: 'Missing store_id, time or party_size' };
   }
 
-  // 大 party 检查(本地预判):超过缓存的 people_num_max,直接判定需转人工,不去查位。
+  // 大 party 检查:超过门店可 AI 预约的最大人数,需转人工,不去查位。
   const maxParty = await getMaxPartySize(store_id);
   if (maxParty != null && Number(party_size) > maxParty) {
-    return tooLargeResponse(party_size, maxParty);
+    return {
+      available: false,
+      too_large: true,
+      max_party_size: maxParty,
+      alternatives: [],
+      message: `A party of ${party_size} is above the maximum of ${maxParty} that can be booked automatically. Parties of ${maxParty + 1} or more are arranged directly with the restaurant — the guest should be transferred to the restaurant.`,
+    };
   }
 
   const tz = await getMerchantTimezone(store_id);
@@ -285,11 +263,6 @@ async function handleCheckAvailability(body) {
     party_size: String(party_size),
     slot_time: [{ start_sec: startSec, duration_sec: duration }],
   });
-
-  // SAAS 返回人数超上限(PEOPLE_NUM_UNAVAILABLE)→ 需转人工。
-  if (isPeopleNumUnavailable(checkResp)) {
-    return tooLargeResponse(party_size, maxParty);
-  }
 
   const slot = (checkResp.slot_time_availability || [])[0] || {};
   const available = !!slot.available;
@@ -342,12 +315,6 @@ async function handleCreateReservation(body) {
     },
     source: body._source_override || CONFIG.SOURCE, // 测试:可用 _source_override 覆盖
   });
-
-  // SAAS 返回人数超上限(PEOPLE_NUM_UNAVAILABLE)→ 需转人工,不当作普通失败。
-  if (isPeopleNumUnavailable(resp)) {
-    const maxParty = await getMaxPartySize(store_id);
-    return tooLargeResponse(party_size, maxParty);
-  }
 
   // 他们的返回:成功 → { booking: { booking_id, status: ... } }
   //             失败 → { booking_failure: { cause } }
@@ -479,7 +446,7 @@ async function handleModifyReservation(body) {
       // 拿不到原预约时间,无法组一个完整的 update 请求。
       return { success: false, message: `I couldn't read the current reservation time, so I can't update the note right now.` };
     }
-    await callSAAS('/weapp/voice-agent/reserve/update', {
+    const noteResp = await callSAAS('/weapp/voice-agent/reserve/update', {
       note: finalNote,   // 顶层放一份(与 create 一致)
       booking: {
         booking_id,
@@ -487,6 +454,13 @@ async function handleModifyReservation(body) {
         note: finalNote, // booking 内也放一份,双保险
       },
     });
+    if (noteResp && noteResp.booking_failure && noteResp.booking_failure.cause) {
+      return {
+        success: false,
+        message: `I wasn't able to update the note just now.`,
+        _cause: String(noteResp.booking_failure.cause),
+      };
+    }
     return {
       success: true, note_only: true, notes: finalNote,
       message: `Note updated${finalNote ? ' to: ' + finalNote : ' (cleared)'}. Time and party size unchanged.`,
@@ -523,7 +497,7 @@ async function handleModifyReservation(body) {
   }
 
   // 有位 → 更新时间/人数,并带上备注(改了用新的,没改保留原的)
-  await callSAAS('/weapp/voice-agent/reserve/update', {
+  const updResp = await callSAAS('/weapp/voice-agent/reserve/update', {
     note: finalNote,   // 顶层放一份(与 create 一致)
     booking: {
       booking_id,
@@ -531,9 +505,36 @@ async function handleModifyReservation(body) {
       note: finalNote, // booking 内也放一份,双保险
     },
   });
+
+  // 检查 update 是否真的成功(和 create 一样,别只看 HTTP 200 就当成功)
+  if (updResp && updResp.booking_failure && updResp.booking_failure.cause) {
+    return {
+      success: false,
+      message: `I wasn't able to update that reservation just now. The original reservation is unchanged.`,
+      _cause: String(updResp.booking_failure.cause),
+    };
+  }
+
+  // 读改后的状态,区分 CONFIRMED / PENDING,让 AI 说对话术
+  const updBooking = updResp.booking || {};
+  const status = updBooking.status || '';
+  let message, confirmed;
+  if (status === 'PENDING_MERCHANT_CONFIRMATION') {
+    confirmed = false;
+    message = `Your reservation change to ${wantsTimeChange ? new_time : 'the new time'}, party of ${finalParty}, has been submitted and is pending confirmation from the restaurant. You'll receive a text once it's confirmed.`;
+  } else {
+    confirmed = true;
+    message = `Your reservation is updated${wantsTimeChange ? ' to ' + new_time : ''}, party of ${finalParty}${finalNote ? ', note: ' + finalNote : ''}. You'll receive a confirmation text shortly.`;
+  }
+
   return {
-    success: true, available: true, notes: finalNote,
-    message: `Reservation updated${wantsTimeChange ? ' to ' + new_time : ''}, party of ${finalParty}${finalNote ? ', note: ' + finalNote : ''}.`,
+    success: true,
+    available: true,
+    status,        // "CONFIRMED" / "PENDING_MERCHANT_CONFIRMATION"
+    confirmed,     // AI 用这个区分话术
+    notes: finalNote,
+    confirmation_number: updBooking.booking_id || booking_id || '',
+    message,
   };
 }
 
