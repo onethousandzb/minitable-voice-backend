@@ -97,9 +97,113 @@ function readBody(req) {
 // ────────────────────────────────────────────────────────────
 //  调用 Minitable 真实接口(带 Basic Auth)
 // ────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+//  内存日志缓冲区(供 /logs 页面查看,不依赖服务器命令行)
+//  只存最近 N 条,重启后清空。含 SAAS 请求/返回、每次工具调用。
+// ────────────────────────────────────────────────────────────
+const LOG_BUFFER = [];
+const LOG_MAX = 300;                       // 最多存 300 条
+const LOG_PASSWORD = process.env.LOG_PASSWORD || 'minitable';  // 日志页密码,可用环境变量覆盖
+function pushLog(type, detail) {
+  LOG_BUFFER.push({ t: new Date().toISOString(), type, detail });
+  if (LOG_BUFFER.length > LOG_MAX) LOG_BUFFER.shift();
+}
+
+// 日志查看页面(登录 + 展示)。纯前端,密码提交到 /logs/data 校验。
+const LOGS_PAGE_HTML = `<!doctype html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice AI 后端日志</title>
+<style>
+  *{box-sizing:border-box;} body{margin:0;background:#0b0e14;color:#e7ebf3;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",monospace;}
+  .top{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid #1c2333;position:sticky;top:0;background:#0b0e14ee;backdrop-filter:blur(8px);}
+  .top h1{font-size:15px;margin:0;font-weight:700;color:#c7d0e3;}
+  .top .sp{flex:1;}
+  button{background:#151b2b;border:1px solid #2a3550;color:#c7d0e3;border-radius:8px;padding:7px 13px;font-size:13px;font-weight:600;cursor:pointer;}
+  button:hover{border-color:#6366f1;color:#fff;}
+  input{background:#111725;border:1px solid #2a3550;border-radius:8px;color:#e7ebf3;padding:9px 12px;font-size:14px;}
+  .login{max-width:340px;margin:80px auto;text-align:center;}
+  .login h2{font-size:18px;color:#c7d0e3;}
+  .login input{width:100%;margin:14px 0;}
+  .login button{width:100%;padding:11px;}
+  .err{color:#f87171;font-size:13px;margin-top:8px;min-height:18px;}
+  .wrap{padding:16px 20px;max-width:1200px;margin:0 auto;}
+  .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;}
+  .filters button{font-size:12px;padding:5px 11px;}
+  .filters button.on{background:#232c44;color:#fff;border-color:#6366f1;}
+  .log{border:1px solid #1c2333;border-radius:8px;overflow:hidden;}
+  .row{display:grid;grid-template-columns:150px 90px 1fr;gap:10px;padding:8px 12px;font-size:12.5px;border-bottom:1px solid #161d2c;align-items:start;}
+  .row:hover{background:#141b2b;}
+  .ts{color:#6c7891;white-space:nowrap;font-variant-numeric:tabular-nums;}
+  .tag{font-weight:700;white-space:nowrap;}
+  .tag.REQUEST{color:#818cf8;} .tag.RESULT{color:#4ade80;}
+  .tag.SAAScall{color:#38bdf8;} .tag.SAASresp{color:#22c55e;} .tag.ERROR{color:#f87171;}
+  .detail{color:#c9d3e8;word-break:break-all;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;}
+  .empty{color:#6c7891;text-align:center;padding:40px;font-size:13px;}
+</style></head><body>
+<div id="login" class="login">
+  <h2>Voice AI 后端日志</h2>
+  <input id="pw" type="password" placeholder="输入密码" onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">登录</button>
+  <div id="err" class="err"></div>
+</div>
+<div id="app" style="display:none">
+  <div class="top">
+    <h1>Voice AI 后端日志</h1>
+    <span class="sp"></span>
+    <label style="font-size:12px;color:#8b96ad;"><input type="checkbox" id="auto" onchange="toggleAuto()"> 自动刷新</label>
+    <button onclick="load()">刷新</button>
+    <button onclick="logout()">退出</button>
+  </div>
+  <div class="wrap">
+    <div class="filters">
+      <button class="on" data-f="all" onclick="setF(this)">全部</button>
+      <button data-f="REQUEST" onclick="setF(this)">工具请求</button>
+      <button data-f="RESULT" onclick="setF(this)">工具结果</button>
+      <button data-f="SAAS" onclick="setF(this)">SAAS 往返</button>
+      <button data-f="ERROR" onclick="setF(this)">错误</button>
+    </div>
+    <div id="log" class="log"></div>
+  </div>
+</div>
+<script>
+  let PW='', DATA=[], FILT='all', timer=null;
+  async function doLogin(){
+    PW=document.getElementById('pw').value;
+    const ok=await load(true);
+    if(ok){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';}
+    else{document.getElementById('err').textContent='密码错误';}
+  }
+  function logout(){PW='';DATA=[];if(timer)clearInterval(timer);document.getElementById('app').style.display='none';document.getElementById('login').style.display='block';document.getElementById('pw').value='';}
+  async function load(silent){
+    try{
+      const r=await fetch('/logs/data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:PW})});
+      if(r.status===401){if(!silent)document.getElementById('err').textContent='密码错误';return false;}
+      const d=await r.json();DATA=d.logs||[];render();return true;
+    }catch(e){return false;}
+  }
+  function setF(btn){document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('on'));btn.classList.add('on');FILT=btn.dataset.f;render();}
+  function tagClass(t){if(t.includes('SAAS'))return t.includes('→')?'SAAScall':'SAASresp';return t;}
+  function render(){
+    const box=document.getElementById('log');
+    let rows=DATA;
+    if(FILT!=='all')rows=DATA.filter(x=>x.type.includes(FILT)|| (FILT==='SAAS'&&x.type.includes('SAAS')));
+    if(!rows.length){box.innerHTML='<div class="empty">暂无日志(重启后清空,或还没有请求)</div>';return;}
+    box.innerHTML=rows.map(x=>{
+      const time=new Date(x.t).toLocaleString('en-CA',{hour12:false});
+      const tc=tagClass(x.type);
+      return '<div class="row"><span class="ts">'+time+'</span><span class="tag '+tc+'">'+x.type+'</span><span class="detail">'+esc(x.detail)+'</span></div>';
+    }).join('');
+  }
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function toggleAuto(){if(document.getElementById('auto').checked){timer=setInterval(load,4000);}else if(timer){clearInterval(timer);}}
+</script>
+</body></html>`;
+
+
 async function callSAAS(path, payload) {
   const auth = 'Basic ' + Buffer.from(`${CONFIG.API_USER}:${CONFIG.API_PASS}`).toString('base64');
   console.log('[SAAS →]', path, JSON.stringify(payload));
+  pushLog('SAAS →', path + ' ' + JSON.stringify(payload));
   const resp = await fetch(CONFIG.API_BASE + path, {
     method: 'POST',
     headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
@@ -107,6 +211,7 @@ async function callSAAS(path, payload) {
   });
   const text = await resp.text();
   console.log('[SAAS ←]', resp.status, text.slice(0, 500));
+  pushLog('SAAS ←', resp.status + ' ' + text.slice(0, 800));
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
   if (!resp.ok) {
@@ -475,28 +580,13 @@ async function handleModifyReservation(body) {
     return { success: false, message: `To change the party size, please also confirm the reservation time.` };
   }
 
-  // 查目标时间 + 目标人数是否有位
-  const checkResp = await callSAAS('/weapp/voice-agent/reserve/availability/check', {
-    merchant_id: store_id,
-    party_size: String(finalParty),
-    slot_time: [{ start_sec: startSec, duration_sec: CONFIG.DEFAULT_DURATION_SEC }],
-  });
-  const slot = (checkResp.slot_time_availability || [])[0] || {};
-  if (!slot.available) {
-    let alternatives = [];
-    try {
-      const sug = await callSAAS('/weapp/voice-agent/reserve/availability/suggest', {
-        merchant_id: store_id, party_size: finalParty,
-        slot_time: { start_sec: startSec, duration_sec: CONFIG.DEFAULT_DURATION_SEC },
-      });
-      alternatives = (sug.suggest_slot_time || []).map(s => toUSTime(s.start_sec, tz));
-    } catch {}
-    const timeLabel = wantsTimeChange ? new_time : 'that time';
-    return { success: false, available: false, alternatives,
-      message: `${timeLabel} is not available for ${finalParty}. Alternatives: ${alternatives.join(', ') || 'none'}. The original reservation is unchanged.` };
-  }
+  // 注意:不在这里用 availability/check 硬拦截。
+  // 原因:PENDING(需门店确认)的时段,查位会返回 available:false,
+  //       但这种时段其实是可以预约的(和 create 落单一致)。
+  //       所以直接尝试 update,由 SAAS 返回真实结果(成功/PENDING/真失败),
+  //       和 create 的处理保持一致。
 
-  // 有位 → 更新时间/人数,并带上备注(改了用新的,没改保留原的)
+  // 更新时间/人数,并带上备注(改了用新的,没改保留原的)
   const updResp = await callSAAS('/weapp/voice-agent/reserve/update', {
     note: finalNote,   // 顶层放一份(与 create 一致)
     booking: {
@@ -506,12 +596,31 @@ async function handleModifyReservation(body) {
     },
   });
 
-  // 检查 update 是否真的成功(和 create 一样,别只看 HTTP 200 就当成功)
+  // update 失败的处理:
   if (updResp && updResp.booking_failure && updResp.booking_failure.cause) {
+    const cause = String(updResp.booking_failure.cause);
+    // 若是「真没位」(SLOT_UNAVAILABLE 且确实约不到),给客人备选时间。
+    if (/SLOT_UNAVAILABLE|UNAVAILABLE|NO_SLOT/i.test(cause)) {
+      let alternatives = [];
+      try {
+        const sug = await callSAAS('/weapp/voice-agent/reserve/availability/suggest', {
+          merchant_id: store_id, party_size: finalParty,
+          slot_time: { start_sec: startSec, duration_sec: CONFIG.DEFAULT_DURATION_SEC },
+        });
+        alternatives = (sug.suggest_slot_time || []).map(s => toUSTime(s.start_sec, tz));
+      } catch {}
+      const timeLabel = wantsTimeChange ? new_time : 'that time';
+      return {
+        success: false, available: false, alternatives,
+        message: `${timeLabel} isn't available for ${finalParty}. Alternatives: ${alternatives.join(', ') || 'none'}. The original reservation is unchanged.`,
+        _cause: cause,
+      };
+    }
+    // 其它失败
     return {
       success: false,
       message: `I wasn't able to update that reservation just now. The original reservation is unchanged.`,
-      _cause: String(updResp.booking_failure.cause),
+      _cause: cause,
     };
   }
 
@@ -642,6 +751,28 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     return sendJSON(res, 200, { status: 'ok', service: 'minitable-real-backend', api_base: CONFIG.API_BASE });
   }
+
+  // ── 日志查看页(带密码登录) ──
+  // GET /logs        → 返回登录+日志页面(HTML)
+  // POST /logs/data  → 传密码,对了返回最近日志的 JSON
+  const urlPath = (req.url || '').split('?')[0];
+  if (req.method === 'GET' && urlPath === '/logs') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(LOGS_PAGE_HTML);
+  }
+  if (req.method === 'POST' && urlPath === '/logs/data') {
+    let body;
+    try { body = await readBody(req); } catch { body = {}; }
+    if (!body || body.password !== LOG_PASSWORD) {
+      return sendJSON(res, 401, { error: 'Wrong password' });
+    }
+    // 最新的在前
+    return sendJSON(res, 200, { logs: LOG_BUFFER.slice().reverse() });
+  }
+
+  if (req.method === 'GET' && req.url === '/health') {
+    return sendJSON(res, 200, { status: 'ok' });
+  }
   const handler = routes[req.url];
   if (req.method !== 'POST' || !handler) return sendJSON(res, 404, { error: 'Not found' });
   if (!checkInboundAuth(req)) return sendJSON(res, 401, { error: 'Unauthorized' });
@@ -649,14 +780,17 @@ const server = http.createServer(async (req, res) => {
   let body;
   try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
   console.log('[REQUEST]', req.url, JSON.stringify(body));
+  pushLog('REQUEST', req.url + ' ' + JSON.stringify(body));
 
   try {
     const result = await handler(body);
     const status = result._status || 200;
     delete result._status;
+    pushLog('RESULT', req.url + ' ' + JSON.stringify(result));
     sendJSON(res, status, result);
   } catch (e) {
     console.error('[ERROR]', req.url, e.message, e.data || '');
+    pushLog('ERROR', req.url + ' ' + e.message + ' ' + JSON.stringify(e.data || ''));
     // 调 SAAS 出错 → 返回明确错误,AI 侧据此转人工
     sendJSON(res, 502, { error: 'Upstream SAAS error', detail: e.message });
   }
