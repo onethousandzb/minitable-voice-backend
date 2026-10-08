@@ -735,6 +735,46 @@ async function handleJoinCallAhead(body) {
 }
 
 // ────────────────────────────────────────────────────────────
+//  接口 8:在线点餐链接短信  POST /send-order-link
+//  客人在电话里说"想点餐/外卖/takeout"→ AI 调这个 → 给客人发一条
+//  带在线点餐链接的短信。
+// ────────────────────────────────────────────────────────────
+
+// 在线点餐链接短信:全部交给 SAAS。
+// SAAS 的 order/send/sms 只收 merchant_id + phone_num:它自己查这家店的
+// online_order_url / order_sms_template、替换 ${link}、判断是否开通并发短信。
+// 返回 { success: {message} } 或 { failure: {cause} }(cause 如 ONLINE_ORDER_NOT_ENABLED)。
+async function handleSendOrderLink(body) {
+  const { store_id, guest_phone } = body;
+  if (!store_id)     return { _status: 400, error: 'Missing store_id' };
+  if (!guest_phone)  return { _status: 400, error: 'Missing guest_phone' };
+
+  const resp = await callSAAS('/weapp/voice-agent/order/send/sms', {
+    merchant_id: store_id,
+    phone_num: normalizePhone(guest_phone),
+  });
+
+  // 没开在线点餐 → 让 AI 说暂不支持(不报错)。
+  const cause = resp?.failure?.cause;
+  if (cause) {
+    const notEnabled = /ONLINE_ORDER_NOT_ENABLED/i.test(cause);
+    return {
+      success: false,
+      enabled: !notEnabled,
+      message: notEnabled
+        ? 'Online ordering is not available for this store.'
+        : 'Could not send the ordering link right now.',
+    };
+  }
+
+  return {
+    success: true,
+    enabled: true,
+    message: `A text with the online ordering link has been sent to ${guest_phone}.`,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
 //  路由
 // ────────────────────────────────────────────────────────────
 const routes = {
@@ -745,6 +785,7 @@ const routes = {
   '/cancel-reservation': handleCancelReservation,
   '/join-waitlist': handleJoinWaitlist,
   '/join-call-ahead': handleJoinCallAhead,
+  '/send-order-link': handleSendOrderLink,
 };
 
 const server = http.createServer(async (req, res) => {
